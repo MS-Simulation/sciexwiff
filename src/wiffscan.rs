@@ -195,6 +195,25 @@ fn put_delta_int(out: &mut Vec<u8>, delta: i64, inten: u32) -> Result<(), CodecE
     put_int(out, inten)
 }
 
+/// The block terminator. Real vendor blocks end their peak-list with a short run of `0xff`
+/// (observed 2-4 bytes) immediately before the next block's metadata.
+///
+/// **Omitting it is not cosmetic.** Without a terminator the vendor ABI reader over-reads past the
+/// authored tokens into the FOLLOWING block's metadata, accumulates a bogus delta, and emits absurd
+/// m/z (~5.9e8) on roughly 1.7% of peaks — which is enough to take a searchable file to **zero**
+/// identifications. Diagnosed in the rustims satellite (`rustdf/src/sim/sciex_dispatch.rs`); porting
+/// it here so the standalone crate cannot reproduce the bug.
+///
+/// Safe for this encoder specifically: `encode_stream` emits intensity 255 as the escaped `7c ff`
+/// and never a bare `0xff`, so appending `0xff` cannot create an ambiguous token boundary.
+/// [`block_payload`] strips any trailing-`0xff` span, so authored blocks round-trip cleanly.
+pub const TERMINATOR: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
+/// Pad byte for clearing a block's unused tail. **`0xff`, never `0x00`** — the reader decodes
+/// trailing `0x00` bytes as spurious peaks, whereas an `0xff` run is the block's natural
+/// end-of-peaklist.
+pub const PAD: u8 = 0xff;
+
 /// Inverse of [`decode_stream`]: encode `peaks` (which MUST be strictly increasing in `n`) to a
 /// token stream. The first peak carries only its intensity (its `n` is the seed/cutoff, supplied
 /// out-of-band). Deltas above [`FD_MAX_DELTA`] are auto-bridged with intensity-1 filler peaks so
@@ -219,6 +238,15 @@ pub fn encode_stream(peaks: &[Peak]) -> Result<Vec<u8>, CodecError> {
         }
         put_delta_int(&mut out, delta, inten)?;
     }
+    Ok(out)
+}
+
+/// [`encode_stream`] plus the [`TERMINATOR`]. **Use this when AUTHORING a block**; bare
+/// `encode_stream` returns pure codec output with no framing, which is right for round-trip tests
+/// and wrong for anything the vendor reader will open.
+pub fn encode_block(peaks: &[Peak]) -> Result<Vec<u8>, CodecError> {
+    let mut out = encode_stream(peaks)?;
+    out.extend_from_slice(&TERMINATOR);
     Ok(out)
 }
 
@@ -741,6 +769,46 @@ mod tests {
     /// Byte-identical parity against a real `.wiff.scan` block, gated behind
     /// `TIMSIM_SCIEX_WIFF_SCAN=<path to a real .wiff.scan>` (skips if unset).
     #[test]
+    /// An AUTHORED block must end with the 0xff terminator, and decoding must not see it as peaks.
+    ///
+    /// This pins a bug that cost a full re-investigation. Without the terminator the vendor ABI
+    /// reader runs past the authored tokens into the next block's metadata and accumulates a bogus
+    /// delta, producing m/z around 5.9e8 on ~1.7% of peaks and taking a searchable file to ZERO
+    /// identifications. It was found and fixed in the rustims satellite and never ported here, so
+    /// this crate silently reproduced the pre-fix behaviour.
+    ///
+    /// The assertions are on the MECHANISM, not just the trailing bytes: a test that only checked
+    /// `ends_with(TERMINATOR)` would pass on an encoder that also corrupted the payload.
+    #[test]
+    fn an_authored_block_is_terminated_and_round_trips() {
+        // A peak at intensity 255 is the adversarial case: it encodes as the escaped `7c ff`, so a
+        // naive terminator search could mistake payload bytes for framing.
+        // Gaps stay under FD_MAX_DELTA on purpose: `encode_stream` AUTO-BRIDGES a larger gap by
+        // emitting a spurious intensity-1 peak at the bridge point, so a wider spacing would not
+        // round-trip and would test bridging rather than framing. (Worth knowing separately: a
+        // synthetic spectrum with sparse peaks spread over a wide m/z range WILL pick up those
+        // bridge peaks.)
+        let peaks: Vec<Peak> = vec![(1000, 7), (1001, 255), (1300, 65_000), (60_000, 3)];
+
+        let bare = encode_stream(&peaks).expect("encode");
+        let block = encode_block(&peaks).expect("encode_block");
+
+        assert_eq!(block.len(), bare.len() + TERMINATOR.len(), "terminator must be appended");
+        assert!(block.ends_with(&TERMINATOR), "authored block must end with the 0xff terminator");
+        assert_eq!(&block[..bare.len()], &bare[..], "payload must be untouched by framing");
+
+        // And the terminator must not decode as peaks: strip a trailing 0xff run, as block_payload
+        // does, and the original peaks must come back exactly.
+        let mut end = block.len();
+        while end > 0 && block[end - 1] == 0xff {
+            end -= 1;
+        }
+        let back = decode_stream(&block[..end], 0, peaks[0].0, peaks.len(), false).expect("decode");
+        assert_eq!(back, peaks, "authored block must round-trip to the same peaks");
+
+        assert_eq!(PAD, 0xff, "clearing pads with 0xff; 0x00 decodes as spurious peaks");
+    }
+
     fn parity_real_wiff_scan() {
         let path = match std::env::var("TIMSIM_SCIEX_WIFF_SCAN") {
             Ok(p) => p,
