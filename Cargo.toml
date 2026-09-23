@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust reader and writer for SCIEX .wiff files (OLE2/CFB container) — no Clearcore2 SDK."
-repository = "https://github.com/theGreatHerrLebert/sciexwiff"
+repository = "https://github.com/MS-Simulation/sciexwiff"
 
 [dependencies]
 cfb = "0.10"
